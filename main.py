@@ -1,44 +1,68 @@
-from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse, FileResponse
 import pandas as pd
 import joblib
 import os
 import io
+import glob
+import datetime
 
 app = FastAPI(title="Biomarker Analysis API")
 
-# Load model and feature schema once at startup
 MODEL_PATH = "biomarker_model.pkl"
 FEATURES_PATH = "feature_columns.pkl"
-
-biomarker_model = joblib.load(MODEL_PATH)
-feature_columns = joblib.load(FEATURES_PATH)
-
 DATA_DIR = "data_outputs"
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# Load model + features globally
+biomarker_model = None
+feature_columns = None
+
+@app.on_event("startup")
+def load_model():
+    global biomarker_model, feature_columns
+    try:
+        biomarker_model = joblib.load(MODEL_PATH)
+        feature_columns = joblib.load(FEATURES_PATH)
+        print("✅ Model and features loaded successfully.")
+    except Exception as e:
+        print(f"⚠️ Warning: Could not load model or features: {e}")
+
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Biomarker API is running 🚀",
+        "docs": "http://127.0.0.1:8000/docs",
+        "endpoints": [
+            "/agent1/process",
+            "/agent2/predict",
+            "/agent3/aggregate",
+            "/download/features",
+            "/download/scored",
+            "/download/results"
+        ]
+    }
+
 
 @app.post("/agent1/process")
-async def process_data(file: UploadFile = File(None), source: str = Form("csv")):
-    """
-    Preprocess uploaded CSV or SQL-fetched data.
-    Align columns to feature schema.
-    """
+async def process_data(file: UploadFile = File(...)):
+    """Upload raw CSV → align with features → save features.csv"""
     try:
-        if source == "csv":
-            contents = await file.read()
-            df = pd.read_csv(io.BytesIO(contents))
-        else:
-            # Placeholder: connect to SQL Server if needed
-            return JSONResponse({"status": "error", "message": "SQL fetch not implemented"}, status_code=400)
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
 
-        # Align features
-        missing_cols = [c for c in feature_columns if c not in df.columns]
-        for c in missing_cols:
-            df[c] = 0
+        if feature_columns is None:
+            return JSONResponse({"status": "error", "message": "Feature columns not loaded"}, status_code=500)
+
+        # Align schema
+        for col in feature_columns:
+            if col not in df.columns:
+                df[col] = 0
         df = df[feature_columns]
 
-        features_path = os.path.join(DATA_DIR, "features.csv")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        features_path = os.path.join(DATA_DIR, f"features_{timestamp}.csv")
         df.to_csv(features_path, index=False)
 
         return {"status": "success", "features_path": features_path}
@@ -48,14 +72,21 @@ async def process_data(file: UploadFile = File(None), source: str = Form("csv"))
 
 
 @app.post("/agent2/predict")
-async def predict(features_path: str = Form(...)):
-    """
-    Run model prediction on preprocessed features.
-    """
+async def predict():
+    """Run ML predictions → save scored_predictions.csv"""
     try:
+        if biomarker_model is None:
+            return JSONResponse({"status": "error", "message": "Model not loaded"}, status_code=500)
+
+        files = sorted(glob.glob(os.path.join(DATA_DIR, "features_*.csv")))
+        if not files:
+            return JSONResponse({"status": "error", "message": "No features file found. Run /agent1/process first."}, status_code=400)
+        
+        features_path = files[-1]
         df = pd.read_csv(features_path)
+
         preds = biomarker_model.predict(df)
-        conf = biomarker_model.predict_proba(df)[:, 1] if hasattr(biomarker_model, "predict_proba") else None
+        conf = biomarker_model.predict_proba(df)[:, 1] if hasattr(biomarker_model, "predict_proba") else [None] * len(preds)
 
         result_df = pd.DataFrame({
             "Biomarker": df.index,
@@ -63,7 +94,8 @@ async def predict(features_path: str = Form(...)):
             "Confidence": conf
         })
 
-        scored_path = os.path.join(DATA_DIR, "scored_predictions.csv")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        scored_path = os.path.join(DATA_DIR, f"scored_predictions_{timestamp}.csv")
         result_df.to_csv(scored_path, index=False)
 
         return {"status": "success", "scored_path": scored_path}
@@ -73,19 +105,55 @@ async def predict(features_path: str = Form(...)):
 
 
 @app.post("/agent3/aggregate")
-async def aggregate(scored_path: str = Form(...)):
-    """
-    Aggregate results into final biomarker scores.
-    """
+async def aggregate():
+    """Aggregate results → save biomarker_results.csv"""
     try:
+        files = sorted(glob.glob(os.path.join(DATA_DIR, "scored_predictions_*.csv")))
+        if not files:
+            return JSONResponse({"status": "error", "message": "No scored predictions found. Run /agent2/predict first."}, status_code=400)
+        
+        scored_path = files[-1]
         df = pd.read_csv(scored_path)
-        df["Final_Score"] = df["Confidence"] * 100  # Simple weighted example
+
+        df["Final_Score"] = df["Confidence"] * 100
         df_sorted = df.sort_values(by="Final_Score", ascending=False)
 
-        result_path = os.path.join(DATA_DIR, "biomarker_results.csv")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        result_path = os.path.join(DATA_DIR, f"biomarker_results_{timestamp}.csv")
         df_sorted.to_csv(result_path, index=False)
 
         return {"status": "success", "results_path": result_path}
 
     except Exception as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+# -------------------------
+# Download Endpoints
+# -------------------------
+
+@app.get("/download/features")
+async def download_features():
+    """Download the latest features file"""
+    files = sorted(glob.glob(os.path.join(DATA_DIR, "features_*.csv")))
+    if not files:
+        return JSONResponse({"status": "error", "message": "No features file found"}, status_code=400)
+    return FileResponse(files[-1], filename="features.csv", media_type="text/csv")
+
+
+@app.get("/download/scored")
+async def download_scored():
+    """Download the latest scored predictions"""
+    files = sorted(glob.glob(os.path.join(DATA_DIR, "scored_predictions_*.csv")))
+    if not files:
+        return JSONResponse({"status": "error", "message": "No scored predictions found"}, status_code=400)
+    return FileResponse(files[-1], filename="scored_predictions.csv", media_type="text/csv")
+
+
+@app.get("/download/results")
+async def download_results():
+    """Download the final biomarker results"""
+    files = sorted(glob.glob(os.path.join(DATA_DIR, "biomarker_results_*.csv")))
+    if not files:
+        return JSONResponse({"status": "error", "message": "No results file found"}, status_code=400)
+    return FileResponse(files[-1], filename="biomarker_results.csv", media_type="text/csv")

@@ -33,7 +33,7 @@ def load_model():
 async def root():
     return {
         "message": "Biomarker API is running 🚀",
-        "docs": "http://127.0.0.1:8000/docs",
+        "docs": "/docs",
         "endpoints": [
             "/agent1/process",
             "/agent2/predict",
@@ -157,3 +157,12 @@ async def download_results():
     if not files:
         return JSONResponse({"status": "error", "message": "No results file found"}, status_code=400)
     return FileResponse(files[-1], filename="biomarker_results.csv", media_type="text/csv")
+
+
+# -------------------------------------------------
+# Run locally or on Render with dynamic PORT
+# -------------------------------------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
